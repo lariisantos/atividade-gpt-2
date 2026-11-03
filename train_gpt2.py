@@ -5,6 +5,9 @@ import torch.nn as nn
 from torch.nn import functional as F
 import tiktoken
 
+# -----------------------------------------------------------------------------
+# 1. Arquitetura do Modelo GPT-2 (com FlashAttention e Weight Sharing)
+# -----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -15,23 +18,18 @@ class CausalSelfAttention(nn.Module):
         self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(config.block_size, config.block_size))
-            .view(1, 1, config.block_size, config.block_size),
-        )
 
     def forward(self, x):
         B, T, C = x.size()
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
+        
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
+
+        # FlashAttention Kernel Otimizado
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
 
@@ -65,7 +63,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50257
+    vocab_size: int = 50304  # Vocabulário arredondado para múltiplos de 64 (eficiência de Tensor Cores)
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -82,7 +80,7 @@ class GPT(nn.Module):
             ln_f=nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight
+        self.transformer.wte.weight = self.lm_head.weight  # Weight Sharing
 
         self.apply(self._init_weights)
 
@@ -99,7 +97,7 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
-        assert T <= self.config.block_size, f"Sequência de tamanho {T} excede {self.config.block_size}"
+        assert T <= self.config.block_size, f"Sequência {T} excede o limite {self.config.block_size}"
         
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
         pos_emb = self.transformer.wpe(pos)
@@ -116,6 +114,44 @@ class GPT(nn.Module):
 
         return logits, loss
 
+    @classmethod
+    def from_pretrained(cls, model_type):
+        """Carrega os pesos oficiais do GPT-2 da Hugging Face."""
+        assert model_type in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
+        from transformers import GPT2LMHeadModel
+
+        config_args = {
+            "gpt2":        dict(n_layer=12, n_head=12, n_embd=768),
+            "gpt2-medium": dict(n_layer=24, n_head=16, n_embd=1024),
+            "gpt2-large":  dict(n_layer=36, n_head=20, n_embd=1280),
+            "gpt2-xl":     dict(n_layer=48, n_head=25, n_embd=1600),
+        }[model_type]
+        config_args["vocab_size"] = 50257
+        config_args["block_size"] = 1024
+
+        model = GPT(GPTConfig(**config_args))
+        sd = model.state_dict()
+        sd_keys = [k for k in sd.keys() if not k.endswith(".attn.bias")]
+
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+        sd_keys_hf = [k for k in sd_hf.keys()
+                      if not k.endswith(".attn.masked_bias") and not k.endswith(".attn.bias")]
+
+        transposed = ["attn.c_attn.weight", "attn.c_proj.weight",
+                      "mlp.c_fc.weight", "mlp.c_proj.weight"]
+        assert len(sd_keys_hf) == len(sd_keys), f"Chaves diferentes: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+        return model
+
     def configure_optimizers(self, weight_decay, learning_rate, device):
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
@@ -129,9 +165,12 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
         return optimizer
 
+# -----------------------------------------------------------------------------
+# 2. Carregador de Dados (DataLoaderLite)
+# -----------------------------------------------------------------------------
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, split="train"):
         self.B = B
         self.T = T
 
@@ -140,8 +179,14 @@ class DataLoaderLite:
             
         enc = tiktoken.get_encoding("gpt2")
         tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens, dtype=torch.long)
-        print(f"Carregados {len(self.tokens)} tokens do dataset")
+        
+        n = int(0.9 * len(tokens))
+        if split == "train":
+            self.tokens = torch.tensor(tokens[:n], dtype=torch.long)
+        else:
+            self.tokens = torch.tensor(tokens[n:], dtype=torch.long)
+            
+        print(f"[{split.upper()}] Carregados {len(self.tokens)} tokens do dataset")
         self.current_position = 0
 
     def next_batch(self):
@@ -155,14 +200,19 @@ class DataLoaderLite:
             self.current_position = 0
         return x, y
 
+# -----------------------------------------------------------------------------
+# 3. Loop Principal de Treino e Validação
+# -----------------------------------------------------------------------------
 
-# -----------------------------------------------------------------------------
-# Agendador de Taxa de Aprendizado (Cosine Decay com Warmup)
-# -----------------------------------------------------------------------------
+B = 2
+T = 16
+total_batch_size = 64
+grad_accum_steps = total_batch_size // (B * T)
+
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 5
-max_steps = 20  # Mantido em 20 passos curtos para leveza na CPU
+max_steps = 20
 
 def get_lr(it):
     if it < warmup_steps:
@@ -177,52 +227,57 @@ def get_lr(it):
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Usando dispositivo: {device}")
+    print(f"Dispositivo em uso: {device}")
 
-    # PARÂMETROS LEVES MANTIDOS: B=2, T=16
-    train_loader = DataLoaderLite(B=2, T=16)
+    train_loader = DataLoaderLite(B=B, T=T, split="train")
+    val_loader = DataLoaderLite(B=B, T=T, split="val")
+
     model = GPT(GPTConfig())
     model.to(device)
 
     optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
-    print("\nIniciando treinamento com Cosine LR Scheduler...")
+    best_val_loss = float("inf")
+
+    print("\nIniciando treinamento...")
     for step in range(max_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        
+        # Validação periódica
+        if step % 5 == 0 or step == max_steps - 1:
+            model.eval()
+            val_loss_accum = 0.0
+            val_steps = 5
+            with torch.no_grad():
+                for _ in range(val_steps):
+                    x_val, y_val = val_loader.next_batch()
+                    x_val, y_val = x_val.to(device), y_val.to(device)
+                    _, val_loss = model(x_val, y_val)
+                    val_loss_accum += val_loss.item() / val_steps
+
+            print(f"--- PASSO {step:2d} | Validation Loss: {val_loss_accum:.4f} ---")
+            
+            if val_loss_accum < best_val_loss:
+                best_val_loss = val_loss_accum
+                torch.save(model.state_dict(), "model_checkpoint.pt")
+                print(f"   -> Checkpoint salvo! (Melhor Val Loss: {best_val_loss:.4f})")
+
+        # Passo de Treino
+        model.train()
         optimizer.zero_grad()
-        
-        # Ajusta dinamicamente o Learning Rate para este passo
+        loss_accum = 0.0
+
+        for micro_step in range(grad_accum_steps):
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            logits, loss = model(x, y)
+            loss = loss / grad_accum_steps
+            loss_accum += loss.detach()
+            loss.backward()
+
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        logits, loss = model(x, y)
-        loss.backward()
-        
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
-        print(f"passo {step:2d} | loss: {loss.item():.4f} | lr: {lr:.6f}")
-
-    # -----------------------------------------------------------------------------
-    # Geração de amostra ao final do treinamento
-    # -----------------------------------------------------------------------------
-    print("\n--- Amostra gerada pelo modelo treinado ---")
-    model.eval()
-    enc = tiktoken.get_encoding("gpt2")
-    tokens = enc.encode("KING:")
-    x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)
-
-    while x.size(1) < 30:
-        with torch.no_grad():
-            logits, _ = model(x)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-            ix = torch.multinomial(topk_probs, 1)
-            xcol = torch.gather(topk_indices, -1, ix)
-            x = torch.cat((x, xcol), dim=1)
-
-    print(enc.decode(x[0].tolist()))
+        print(f"passo {step:2d} | train loss: {loss_accum.item():.4f} | lr: {lr:.6f}")
