@@ -1,12 +1,38 @@
+import os
 import math
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+import numpy as np
 import tiktoken
 
 # -----------------------------------------------------------------------------
-# 1. Arquitetura do Modelo GPT-2 (com FlashAttention e Weight Sharing)
+# 1. Configuração de Treino Distribuído (DDP)
+# -----------------------------------------------------------------------------
+
+ddp = int(os.environ.get('RANK', -1)) != -1  # Verifica se foi executado via torchrun
+
+if ddp:
+    assert torch.cuda.is_available(), "Treino DDP requer GPUs com suporte CUDA"
+    dist.init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0  # Processo 0 responsável por logs e salvamento
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# -----------------------------------------------------------------------------
+# 2. Estrutura do Modelo GPT-2
 # -----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
@@ -28,7 +54,6 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # FlashAttention Kernel Otimizado
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
@@ -63,7 +88,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304  # Vocabulário arredondado para múltiplos de 64 (eficiência de Tensor Cores)
+    vocab_size: int = 50304
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -80,7 +105,7 @@ class GPT(nn.Module):
             ln_f=nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight  # Weight Sharing
+        self.transformer.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
 
@@ -116,7 +141,6 @@ class GPT(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_type):
-        """Carrega os pesos oficiais do GPT-2 da Hugging Face."""
         assert model_type in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
         from transformers import GPT2LMHeadModel
 
@@ -166,28 +190,29 @@ class GPT(nn.Module):
         return optimizer
 
 # -----------------------------------------------------------------------------
-# 2. Carregador de Dados (DataLoaderLite)
+# 3. Carregador de Dados Sensível ao DDP
 # -----------------------------------------------------------------------------
 
-class DataLoaderLite:
-    def __init__(self, B, T, split="train"):
+def load_tokens(filename):
+    nparr = np.load(filename)
+    return torch.tensor(nparr.astype(np.int64), dtype=torch.long)
+
+class DataLoaderShard:
+    def __init__(self, B, T, process_rank, num_processes, shard_folder="edu_fineweb10B"):
         self.B = B
         self.T = T
-
-        with open("input.txt", "r", encoding="utf-8") as f:
-            text = f.read()
-            
-        enc = tiktoken.get_encoding("gpt2")
-        tokens = enc.encode(text)
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.shard_folder = shard_folder
         
-        n = int(0.9 * len(tokens))
-        if split == "train":
-            self.tokens = torch.tensor(tokens[:n], dtype=torch.long)
-        else:
-            self.tokens = torch.tensor(tokens[n:], dtype=torch.long)
-            
-        print(f"[{split.upper()}] Carregados {len(self.tokens)} tokens do dataset")
-        self.current_position = 0
+        shards = sorted([f for f in os.listdir(shard_folder) if f.endswith(".npy")])
+        assert len(shards) > 0, f"Nenhum ficheiro .npy encontrado em {shard_folder}"
+        self.shards = [os.path.join(shard_folder, s) for s in shards]
+        
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        # Desloca a posição inicial de acordo com o rank do processo
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -195,19 +220,24 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T)
         y = (buf[1:]).view(B, T)
 
-        self.current_position += B * T
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
+        # Salta posições equivalente ao número total de processos
+        self.current_position += B * T * self.num_processes
+        
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = self.B * self.T * self.process_rank
+            
         return x, y
 
 # -----------------------------------------------------------------------------
-# 3. Loop Principal de Treino e Validação
+# 4. Loop de Treinamento Consolidado
 # -----------------------------------------------------------------------------
 
 B = 2
 T = 16
 total_batch_size = 64
-grad_accum_steps = total_batch_size // (B * T)
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -226,41 +256,24 @@ def get_lr(it):
 
 
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Dispositivo em uso: {device}")
+    if master_process:
+        print(f"Dispositivo em uso: {device} | DDP World Size: {ddp_world_size}")
 
-    train_loader = DataLoaderLite(B=B, T=T, split="train")
-    val_loader = DataLoaderLite(B=B, T=T, split="val")
+    train_loader = DataLoaderShard(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, shard_folder="edu_fineweb10B")
 
     model = GPT(GPTConfig())
     model.to(device)
 
-    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+    
+    raw_model = model.module if ddp else model
+    optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
-    best_val_loss = float("inf")
+    if master_process:
+        print("\nIniciando execução final consolidada...")
 
-    print("\nIniciando treinamento...")
     for step in range(max_steps):
-        # Validação periódica
-        if step % 5 == 0 or step == max_steps - 1:
-            model.eval()
-            val_loss_accum = 0.0
-            val_steps = 5
-            with torch.no_grad():
-                for _ in range(val_steps):
-                    x_val, y_val = val_loader.next_batch()
-                    x_val, y_val = x_val.to(device), y_val.to(device)
-                    _, val_loss = model(x_val, y_val)
-                    val_loss_accum += val_loss.item() / val_steps
-
-            print(f"--- PASSO {step:2d} | Validation Loss: {val_loss_accum:.4f} ---")
-            
-            if val_loss_accum < best_val_loss:
-                best_val_loss = val_loss_accum
-                torch.save(model.state_dict(), "model_checkpoint.pt")
-                print(f"   -> Checkpoint salvo! (Melhor Val Loss: {best_val_loss:.4f})")
-
-        # Passo de Treino
         model.train()
         optimizer.zero_grad()
         loss_accum = 0.0
@@ -271,7 +284,14 @@ if __name__ == "__main__":
             logits, loss = model(x, y)
             loss = loss / grad_accum_steps
             loss_accum += loss.detach()
+            
+            # Sincroniza gradientes apenas no último micro-passo se estiver em DDP
+            if ddp:
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             loss.backward()
+
+        if ddp:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
@@ -280,4 +300,12 @@ if __name__ == "__main__":
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
-        print(f"passo {step:2d} | train loss: {loss_accum.item():.4f} | lr: {lr:.6f}")
+        if master_process:
+            print(f"passo {step:2d} | train loss: {loss_accum.item():.4f} | lr: {lr:.6f}")
+
+    if master_process:
+        torch.save(raw_model.state_dict(), "final_gpt2_reproduction.pt")
+        print("\nTreino finalizado! Pesos salvos em 'final_gpt2_reproduction.pt'.")
+
+    if ddp:
+        dist.destroy_process_group()
