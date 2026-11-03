@@ -12,7 +12,6 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        # Flag para escala especial na inicialização de resíduos
         self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -43,7 +42,6 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
-        # Flag para escala especial na inicialização de resíduos
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
@@ -86,7 +84,6 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
 
-        # Aplica inicialização de pesos customizada
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -120,7 +117,6 @@ class GPT(nn.Module):
         return logits, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, device):
-        # Separa parâmetros 2D (pesos) que recebem weight decay de vetores 1D (biases, layernorms)
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
@@ -160,37 +156,73 @@ class DataLoaderLite:
         return x, y
 
 
+# -----------------------------------------------------------------------------
+# Agendador de Taxa de Aprendizado (Cosine Decay com Warmup)
+# -----------------------------------------------------------------------------
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 5
+max_steps = 20  # Mantido em 20 passos curtos para leveza na CPU
+
+def get_lr(it):
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    if it > max_steps:
+        return min_lr
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
+
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Usando dispositivo: {device}")
 
-    # Configuração de alta precisão de ponto flutuante se houver GPU
-    if device == "cuda":
-        torch.set_float32_matmul_precision('high')
-
+    # PARÂMETROS LEVES MANTIDOS: B=2, T=16
     train_loader = DataLoaderLite(B=2, T=16)
     model = GPT(GPTConfig())
     model.to(device)
 
-    # Usa a função de otimização refinada
-    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=3e-4, device=device)
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
-    print("\nIniciando treinamento otimizado...")
-    for step in range(20):
+    print("\nIniciando treinamento com Cosine LR Scheduler...")
+    for step in range(max_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         
         optimizer.zero_grad()
         
-        # Mixed Precision (Autocast) para maior velocidade se disponível
-        device_type = 'cuda' if 'cuda' in device else 'cpu'
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-            logits, loss = model(x, y)
+        # Ajusta dinamicamente o Learning Rate para este passo
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
+        logits, loss = model(x, y)
         loss.backward()
         
-        # Clipping de gradiente para evitar explosão de gradientes
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
         optimizer.step()
-        print(f"passo {step:2d} | loss: {loss.item():.4f}")
+        
+        print(f"passo {step:2d} | loss: {loss.item():.4f} | lr: {lr:.6f}")
+
+    # -----------------------------------------------------------------------------
+    # Geração de amostra ao final do treinamento
+    # -----------------------------------------------------------------------------
+    print("\n--- Amostra gerada pelo modelo treinado ---")
+    model.eval()
+    enc = tiktoken.get_encoding("gpt2")
+    tokens = enc.encode("KING:")
+    x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)
+
+    while x.size(1) < 30:
+        with torch.no_grad():
+            logits, _ = model(x)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+            ix = torch.multinomial(topk_probs, 1)
+            xcol = torch.gather(topk_indices, -1, ix)
+            x = torch.cat((x, xcol), dim=1)
+
+    print(enc.decode(x[0].tolist()))
