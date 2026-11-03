@@ -1,4 +1,4 @@
-# atividade-gpt-2
+# aAtividade-gpt-2: Grandes Modelos de IA
 # Reprodução do GPT-2 (124M) em PyTorch
 
 Este repositório contém a implementação completa e funcional da reconstrução do GPT-2 (124M) do zero utilizando PyTorch, desenvolvida com base no tutorial "Let's reproduce GPT-2" de Andrej Karpathy.
