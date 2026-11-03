@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import tiktoken
 
 
 class CausalSelfAttention(nn.Module):
@@ -81,6 +82,10 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+        # ADICIONADO: Weight Sharing (Compartilhamento de pesos)
+        # No GPT-2, os pesos do embedding de entrada e da projeção linear de saída são os mesmos
+        self.transformer.wte.weight = self.lm_head.weight
+
     def forward(self, idx):
         # idx tem formato (B, T): B sequências de T índices de tokens
         B, T = idx.size()
@@ -134,3 +139,42 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
         return model
+
+
+# -----------------------------------------------------------------------------
+# ADICIONADO: Script de teste e geração de texto ao executar o arquivo
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Usando dispositivo: {device}")
+
+    # Instancia o modelo carregando os pesos oficiais do GPT-2 (124M)
+    model = GPT.from_pretrained("gpt2")
+    model.eval()
+    model.to(device)
+
+    # Tokenização do prompt de entrada
+    enc = tiktoken.get_encoding("gpt2")
+    prompt = "Hello, I'm a language model,"
+    tokens = enc.encode(prompt)
+    x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)
+
+    # Gera texto até atingir 30 tokens
+    torch.manual_seed(42)
+    while x.size(1) < 30:
+        with torch.no_grad():
+            logits = model(x)
+            logits = logits[:, -1, :]  # Seleciona os logits do último token
+            probs = F.softmax(logits, dim=-1)
+            
+            # Amostragem top-k (k=50)
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+            ix = torch.multinomial(topk_probs, 1)
+            xcol = torch.gather(topk_indices, -1, ix)
+            
+            # Anexa o token sorteado à sequência de entrada
+            x = torch.cat((x, xcol), dim=1)
+
+    # Imprime a saída final decodificada
+    print("\n--- Texto Gerado ---")
+    print(enc.decode(x[0].tolist()))
